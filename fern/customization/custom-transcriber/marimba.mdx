@@ -7,7 +7,7 @@ slug: customization/custom-transcriber/marimba
 
 [Marimba](https://huggingface.co/charcot-ai/marimba) is an open-weight (Apache-2.0) audio model that answers typed questions about the last eight seconds of audio: voice activity, turn end, spoken language, whether a term was said, and speaker questions. It does not produce transcripts. In a [custom transcriber](/customization/custom-transcriber) bridge it decides when the caller's turn is over, while a speech-to-text model of your choice supplies the words.
 
-<Note>The example runs on CPU without API keys, using `openai/whisper-tiny` for speech-to-text. Swap in any speech-to-text callable for production.</Note>
+<Note>The CPU example uses `openai/whisper-tiny` for speech-to-text, without a hosted STT API key. Model downloads require network access and permission to access the weights. Swap in any speech-to-text callable.</Note>
 
 <Steps>
   <Step title="Run the bridge">
@@ -19,23 +19,39 @@ slug: customization/custom-transcriber/marimba
     uv run --extra torch --with fastapi --with 'uvicorn[standard]' python examples/vapi/server.py
     ```
 
-    It keeps **only channel 0** of the interleaved PCM, resamples it to 16 kHz, and checks for speech every 250 ms. While the caller speaks it sends `partial` transcripts. When speech stops it scores turn end on the eight seconds that end where the speech ended. If the score passes the threshold (`TURN_THRESHOLD`, default `0.5`) it sends the `final` transcript. Below the threshold, the turn stays open.
+    It keeps **only channel 0** of the interleaved PCM, resamples it to 16 kHz, and tracks speech with an adaptive energy gate every 20 ms. Three voiced frames start a turn with 200 ms pre-roll. Partials start after roughly 0.5 seconds of speech, throttled to once per second.
+
+    After 300 ms of silence, it scores turn end on the last eight seconds ending at the last voiced frame plus 0.3 seconds. Language uses the same window. A score at or above `TURN_THRESHOLD` (default `0.5`) triggers a final. Otherwise, resumed speech continues the turn; `SILENCE_TIMEOUT` (default `2.5` seconds) forces a final even for an unfinished sentence. `MAX_TURN_SECONDS` (default `30`) bounds long turns. Logs distinguish `turn_end`, `silence_timeout`, and `max_turn`.
+
+    There is no Marimba voice-activity veto: even windows ending at the energy speech offset rejected measured speech at the native threshold. The bridge instead requires minimum speech duration and skips empty STT output. Non-speech audio can still produce hallucinated transcripts.
   </Step>
   <Step title="Point your assistant at it">
-    The bridge listens on `127.0.0.1:8000`. Expose it over `wss` (for example with a tunnel) and set the transcriber:
+    Expose port 8000 over TLS. Generate a fresh opaque key per call and use the same key in both URLs of that call's transient assistant configuration:
 
     ```json
     {
       "transcriber": {
         "provider": "custom-transcriber",
         "server": {
-          "url": "wss://your-server.com/transcriber"
+          "url": "wss://your-server.com/transcriber?session=UNIQUE_CALL_KEY"
+        }
+      },
+      "startSpeakingPlan": {
+        "waitSeconds": 0.25,
+        "smartEndpointingPlan": {
+          "provider": "custom-endpointing-model",
+          "server": {
+            "url": "https://your-server.com/endpointing/UNIQUE_CALL_KEY",
+            "timeoutSeconds": 3
+          }
         }
       }
     }
     ```
 
-    The example does not authenticate requests. Before production, put the bridge behind authentication and reference it with a [custom credential](/server-url/server-authentication).
+    Vapi otherwise runs its own endpointing on partials. The [custom endpointing model](/customization/voice-pipeline-configuration) returns a long wait while a turn is active or decoding, then a short wait briefly after a final. Finite timeouts and CPU latency cannot guarantee Vapi always waits for a final; verify a real call on your hardware.
+
+    Keys associate live state; they are not authentication. Use one server process for this example. Before production, add explicit call routing/state and authentication with a [custom credential](/server-url/server-authentication).
 
     Each finished turn also writes a JSON line with Marimba's typed decisions (turn end as a score, language as a choice). The transcriber protocol only carries text, so send these to your own [server URL](/server-url) or logs if you need them during the call.
   </Step>
@@ -45,7 +61,7 @@ slug: customization/custom-transcriber/marimba
 
 - Turn end: AUROC 0.930 on the Smart Turn v3.2 test set, where Smart Turn v3.2 itself scores 0.982, per the [model card](https://huggingface.co/charcot-ai/marimba).
 - Language: 30 languages, scored over the options you list.
-- Latency: on one NVIDIA L4, p95 per question is 13 ms for turn end, 16 ms for voice activity and 161 ms for language. CPU is slower; measure on your hardware.
+- Latency depends on your hardware and STT. Inference runs off the receive loop, one job per call; measure end-to-end behavior on your hardware.
 - Calibration shifts across domains. Tune `TURN_THRESHOLD` on labeled calls from your own traffic.
 
 ## Troubleshooting
@@ -53,9 +69,13 @@ slug: customization/custom-transcriber/marimba
 | Symptom | Fix |
 | --- | --- |
 | The agent transcribes its own speech | Both channels are being forwarded. Keep only channel 0 from the interleaved PCM |
-| Turns never finalize | Turn end is scored only after speech stops. Lower `TURN_THRESHOLD`, or check that the caller audio reaches the bridge |
-| The assistant replies before the caller finishes | Raise `TURN_THRESHOLD`, and tune [start and stop speaking plans](/customization/voice-pipeline-configuration) so Vapi's own endpointing does not race the bridge |
-| Partials arrive late on CPU | Speech-to-text runs at most once per second. Use a faster speech-to-text model or a GPU |
+| Turns never finalize | Verify channel 0, energy timing, `SILENCE_TIMEOUT`, and that STT returns nonempty text. Inspect the logged TURN score and final reason |
+| The assistant replies before the caller finishes | Configure the endpointing route with a unique matching call key. Finite timeouts can still race the bridge; verify an actual call |
+| Partials arrive late on CPU | STT and inference share one worker per call; partial requests coalesce while busy. Use faster STT or suitable hardware |
+| Noise produces words | The energy gate is heuristic and STT can hallucinate. Use a noise-robust STT/VAD implementation for production |
+| The model is unavailable | Check `/health`; correct model access/configuration and restart. Unavailable WebSockets close with 1011 |
+
+Logs contain scores, labels, counts, and timings, not transcripts or audio. Audio retention is bounded; overload closes with 1013 rather than silently dropping samples. This reference is not a real-time or recognition-quality guarantee.
 
 ## Related
 
