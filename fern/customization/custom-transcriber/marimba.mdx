@@ -1,0 +1,69 @@
+---
+title: Marimba
+subtitle: Use Marimba turn-end decisions in a Vapi custom transcriber
+description: Run Marimba on the caller's audio in a custom-transcriber bridge to decide when the caller has finished, alongside the speech-to-text model of your choice.
+slug: customization/custom-transcriber/marimba
+---
+
+[Marimba](https://huggingface.co/charcot-ai/marimba) is an open-weight (Apache-2.0) audio model that answers typed questions about the last eight seconds of audio: voice activity, turn end, spoken language, whether a term was said, and speaker questions. It does not produce transcripts. In a [custom transcriber](/customization/custom-transcriber) bridge it decides when the caller's turn is over, while a speech-to-text model of your choice supplies the words.
+
+<Note>The example runs on CPU without API keys, using `openai/whisper-tiny` for speech-to-text. Swap in any speech-to-text callable for production.</Note>
+
+<Steps>
+  <Step title="Run the bridge">
+    The [Vapi example](https://github.com/Charcot-AI/marimba-api/tree/main/examples/vapi) in the Marimba repository is a small FastAPI WebSocket server:
+
+    ```bash
+    git clone https://github.com/Charcot-AI/marimba-api.git
+    cd marimba-api
+    uv run --extra torch --with fastapi --with 'uvicorn[standard]' python examples/vapi/server.py
+    ```
+
+    It keeps **only channel 0** of the interleaved PCM, resamples it to 16 kHz, and checks for speech every 250 ms. While the caller speaks it sends `partial` transcripts. When speech stops it scores turn end on the eight seconds that end where the speech ended. If the score passes the threshold (`TURN_THRESHOLD`, default `0.5`) it sends the `final` transcript. Below the threshold, the turn stays open.
+  </Step>
+  <Step title="Point your assistant at it">
+    The bridge listens on `127.0.0.1:8000`. Expose it over `wss` (for example with a tunnel) and set the transcriber:
+
+    ```json
+    {
+      "transcriber": {
+        "provider": "custom-transcriber",
+        "server": {
+          "url": "wss://your-server.com/transcriber"
+        }
+      }
+    }
+    ```
+
+    The example does not authenticate requests. Before production, put the bridge behind authentication and reference it with a [custom credential](/server-url/server-authentication).
+
+    Each finished turn also writes a JSON line with Marimba's typed decisions (turn end as a score, language as a choice). The transcriber protocol only carries text, so send these to your own [server URL](/server-url) or logs if you need them during the call.
+  </Step>
+</Steps>
+
+## What to expect
+
+- Turn end: AUROC 0.930 on the Smart Turn v3.2 test set, where Smart Turn v3.2 itself scores 0.982, per the [model card](https://huggingface.co/charcot-ai/marimba).
+- Language: 30 languages, scored over the options you list.
+- Latency: on one NVIDIA L4, p95 per question is 13 ms for turn end, 16 ms for voice activity and 161 ms for language. CPU is slower; measure on your hardware.
+- Calibration shifts across domains. Tune `TURN_THRESHOLD` on labeled calls from your own traffic.
+
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| The agent transcribes its own speech | Both channels are being forwarded. Keep only channel 0 from the interleaved PCM |
+| Turns never finalize | Turn end is scored only after speech stops. Lower `TURN_THRESHOLD`, or check that the caller audio reaches the bridge |
+| The assistant replies before the caller finishes | Raise `TURN_THRESHOLD`, and tune [start and stop speaking plans](/customization/voice-pipeline-configuration) so Vapi's own endpointing does not race the bridge |
+| Partials arrive late on CPU | Speech-to-text runs at most once per second. Use a faster speech-to-text model or a GPU |
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Marimba Vapi example" icon="github" href="https://github.com/Charcot-AI/marimba-api/tree/main/examples/vapi">
+    The bridge, a mock Vapi client and protocol tests.
+  </Card>
+  <Card title="Marimba model card" icon="book" href="https://huggingface.co/charcot-ai/marimba">
+    Questions, results and limitations.
+  </Card>
+</CardGroup>
