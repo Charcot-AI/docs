@@ -23,7 +23,7 @@ slug: customization/custom-transcriber/marimba
 
     After 300 ms of silence, it scores turn end on the last eight seconds ending at the last voiced frame plus 0.3 seconds. Language uses the same window. A score at or above `TURN_THRESHOLD` (default `0.5`) triggers a final. Otherwise, resumed speech continues the turn; `SILENCE_TIMEOUT` (default `2.5` seconds) forces a final even for an unfinished sentence. `MAX_TURN_SECONDS` (default `30`) bounds long turns. Logs distinguish `turn_end`, `silence_timeout`, and `max_turn`.
 
-    There is no Marimba voice-activity veto: even windows ending at the energy speech offset rejected measured speech at the native threshold. The bridge instead requires minimum speech duration and skips empty STT output. Non-speech audio can still produce hallucinated transcripts.
+    There is no Marimba voice-activity veto: even multiple within-turn windows rejected measured speech at the native threshold. The bridge instead requires minimum speech duration and skips empty STT output. Non-speech noise can trigger STT hallucinations; put your STT's no-speech filtering in front of the bridge.
   </Step>
   <Step title="Point your assistant at it">
     Expose port 8000 over TLS. Generate a fresh opaque key per call and use the same key in both URLs of that call's transient assistant configuration:
@@ -53,7 +53,7 @@ slug: customization/custom-transcriber/marimba
 
     Keys associate live state; they are not authentication. Use one server process for this example. Before production, add explicit call routing/state and authentication with a [custom credential](/server-url/server-authentication).
 
-    Each finished turn also writes a JSON line with Marimba's typed decisions (turn end as a score, language as a choice). The transcriber protocol only carries text, so send these to your own [server URL](/server-url) or logs if you need them during the call.
+    Each final waits for STT and language inference, then logs its turn-end score, language choice, and reason together before sending the transcript. An immediate disconnect cannot cancel later metadata work. The transcriber protocol only carries text; consume decision logs separately if you need them during the call.
   </Step>
 </Steps>
 
@@ -72,7 +72,7 @@ slug: customization/custom-transcriber/marimba
 | Turns never finalize | Verify channel 0, energy timing, `SILENCE_TIMEOUT`, and that STT returns nonempty text. Inspect the logged TURN score and final reason |
 | The assistant replies before the caller finishes | Configure the endpointing route with a unique matching call key. Finite timeouts can still race the bridge; verify an actual call |
 | Partials arrive late on CPU | STT and inference share one worker per call; partial requests coalesce while busy. Use faster STT or suitable hardware |
-| Noise produces words | The energy gate is heuristic and STT can hallucinate. Use a noise-robust STT/VAD implementation for production |
+| Noise produces words | The energy gate is heuristic. Put your STT's no-speech filtering in front; nonempty hallucinations are not rejected by this example |
 | The model is unavailable | Check `/health`; correct model access/configuration and restart. Unavailable WebSockets close with 1011 |
 
 Logs contain scores, labels, counts, and timings, not transcripts or audio. Audio retention is bounded; overload closes with 1013 rather than silently dropping samples. This reference is not a real-time or recognition-quality guarantee.
